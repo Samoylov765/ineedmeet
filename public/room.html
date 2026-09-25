@@ -1,0 +1,125 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ineedmeet — комната</title>
+<style>
+  * { box-sizing: border-box; }
+  body { margin: 0; height: 100vh; display: flex; flex-direction: column; background: #111; color: #eee; font-family: system-ui, sans-serif; }
+  #top { padding: 10px 14px; display: flex; gap: 10px; align-items: center; background: #1a1a1a; font-size: 14px; }
+  #top input { flex: 1; background: #222; color: #eee; border: 1px solid #333; border-radius: 6px; padding: 8px; }
+  button { background: #2d7ff9; color: #fff; border: 0; border-radius: 8px; padding: 10px 16px; font-size: 15px; cursor: pointer; }
+  button.off { background: #c0392b; }
+  button.leave { background: #444; }
+  #stage { flex: 1; position: relative; background: #000; min-height: 0; }
+  #remote { width: 100%; height: 100%; object-fit: contain; background: #000; }
+  #local { position: absolute; right: 14px; bottom: 14px; width: 180px; max-width: 30%; border-radius: 10px; border: 2px solid #333; background: #222; transform: scaleX(-1); }
+  #status { position: absolute; left: 0; right: 0; top: 40%; text-align: center; color: #aaa; font-size: 18px; padding: 0 20px; pointer-events: none; }
+  #bar { display: flex; gap: 10px; justify-content: center; padding: 12px; background: #1a1a1a; }
+</style>
+</head>
+<body>
+  <div id="top">
+    <span>Ссылка для собеседника:</span>
+    <input id="link" readonly>
+    <button id="copy">Копировать</button>
+  </div>
+  <div id="stage">
+    <video id="remote" autoplay playsinline></video>
+    <video id="local" autoplay playsinline muted></video>
+    <div id="status">Запрашиваю камеру и микрофон…</div>
+  </div>
+  <div id="bar">
+    <button id="mic">Микрофон: вкл</button>
+    <button id="cam">Камера: вкл</button>
+    <button id="leave" class="leave">Выйти</button>
+  </div>
+
+<script>
+const room = location.pathname.split('/').pop();
+const $ = (id) => document.getElementById(id);
+const status = (t) => { $('status').textContent = t; $('status').style.display = t ? 'block' : 'none'; };
+
+$('link').value = location.href;
+$('copy').onclick = async () => {
+  try { await navigator.clipboard.writeText(location.href); $('copy').textContent = 'Скопировано'; }
+  catch { $('link').select(); document.execCommand('copy'); }
+  setTimeout(() => $('copy').textContent = 'Копировать', 1500);
+};
+
+const ICE = { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }, { urls: 'stun:stun1.l.google.com:19302' }] };
+let pc, ws, localStream, initiator = false;
+
+async function start() {
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    return status('Браузер не даёт доступ к камере. Нужен HTTPS-адрес (или localhost).');
+  }
+  try {
+    localStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+  } catch (e) {
+    return status('Нет доступа к камере/микрофону. Разрешите доступ в браузере и обновите страницу.');
+  }
+  $('local').srcObject = localStream;
+  status('Ждём собеседника… Отправьте ему ссылку.');
+  connectWS();
+}
+
+function connectWS() {
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  ws = new WebSocket(`${proto}://${location.host}/ws?room=${room}`);
+  let chain = Promise.resolve();
+  ws.onmessage = (ev) => { chain = chain.then(() => handle(ev)).catch(console.error); };
+  async function handle(ev) {
+    const msg = JSON.parse(ev.data);
+    if (msg.type === 'full') return status('В комнате уже двое. Эта версия поддерживает только 2 участников.');
+    if (msg.type === 'joined') { initiator = msg.initiator; if (initiator) { status('Соединяем…'); await call(); } return; }
+    if (msg.type === 'peer-joined') { status('Собеседник зашёл, соединяем…'); return; }
+    if (msg.type === 'peer-left') { closePeer(); status('Собеседник вышел. Ждём…'); return; }
+    if (msg.type === 'offer') { makePC(); await pc.setRemoteDescription(msg.sdp); const a = await pc.createAnswer(); await pc.setLocalDescription(a); ws.send(JSON.stringify({ type: 'answer', sdp: pc.localDescription })); return; }
+    if (msg.type === 'answer') { await pc.setRemoteDescription(msg.sdp); return; }
+    if (msg.type === 'ice' && pc) { try { await pc.addIceCandidate(msg.candidate); } catch {} }
+  }
+}
+
+function makePC() {
+  closePeer();
+  pc = new RTCPeerConnection(ICE);
+  localStream.getTracks().forEach((t) => pc.addTrack(t, localStream));
+  pc.onicecandidate = (e) => e.candidate && ws.readyState === 1 && ws.send(JSON.stringify({ type: 'ice', candidate: e.candidate }));
+  pc.ontrack = (e) => { $('remote').srcObject = e.streams[0]; status(''); };
+  pc.onconnectionstatechange = () => {
+    if (pc.connectionState === 'failed') status('Не удалось соединиться напрямую (нужен TURN-сервер).');
+  };
+}
+
+async function call() {
+  makePC();
+  const o = await pc.createOffer();
+  await pc.setLocalDescription(o);
+  ws.send(JSON.stringify({ type: 'offer', sdp: pc.localDescription }));
+}
+
+function closePeer() {
+  if (pc) { pc.close(); pc = null; }
+  $('remote').srcObject = null;
+}
+
+$('mic').onclick = () => {
+  const t = localStream && localStream.getAudioTracks()[0]; if (!t) return;
+  t.enabled = !t.enabled;
+  $('mic').textContent = 'Микрофон: ' + (t.enabled ? 'вкл' : 'выкл');
+  $('mic').classList.toggle('off', !t.enabled);
+};
+$('cam').onclick = () => {
+  const t = localStream && localStream.getVideoTracks()[0]; if (!t) return;
+  t.enabled = !t.enabled;
+  $('cam').textContent = 'Камера: ' + (t.enabled ? 'вкл' : 'выкл');
+  $('cam').classList.toggle('off', !t.enabled);
+};
+$('leave').onclick = () => { closePeer(); if (ws) ws.close(); if (localStream) localStream.getTracks().forEach((t) => t.stop()); location.href = '/'; };
+
+start();
+</script>
+</body>
+</html>
